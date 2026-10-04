@@ -36,11 +36,15 @@ from utils.decode_param import *
 from utils.transformation_utils import *
 from utils.camera_view_utils import *
 from utils.render_utils import *
+from utils.thermal_render import temperature_to_rgb, synchronize_gaussian_temperature, save_temperature_frame
 
 wp.init()
 wp.config.verify_cuda = True
 
-ti.init(arch=ti.cuda, device_memory_GB=8.0)
+ti.init(
+    arch=ti.cuda,
+    device_memory_GB=float(os.environ.get("PHYS_GAUSSIAN_TAICHI_MEMORY_GB", "2.0")),
+)
 
 
 class PipelineParamsNoparse:
@@ -75,10 +79,18 @@ if __name__ == "__main__":
     parser.add_argument("--output_ply", action="store_true")
     parser.add_argument("--output_h5", action="store_true")
     parser.add_argument("--render_img", action="store_true")
+    parser.add_argument("--render_temperature", action="store_true")
+    parser.add_argument("--output_temperature", action="store_true")
+    parser.add_argument("--temperature_range", type=float, nargs=2, default=[20.0, 100.0],
+                        metavar=("MIN", "MAX"))
     parser.add_argument("--compile_video", action="store_true")
     parser.add_argument("--white_bg", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+    if (args.render_temperature or args.output_temperature) and args.output_path is None:
+        parser.error("temperature output requires --output_path")
+    if args.temperature_range[1] <= args.temperature_range[0]:
+        parser.error("temperature_range MAX must exceed MIN")
 
     if not os.path.exists(args.model_path):
         AssertionError("Model path does not exist!")
@@ -101,6 +113,10 @@ if __name__ == "__main__":
     print("Loading gaussians...")
     model_path = args.model_path
     gaussians = load_checkpoint(model_path)
+    thermal_config = material_params.get("thermal", {})
+    if "initial_temperature" in thermal_config:
+        gaussians.set_temperature(thermal_config["initial_temperature"])
+    gaussian_indices = torch.arange(gaussians.get_xyz.shape[0], device="cuda")
     pipeline = PipelineParamsNoparse()
     pipeline.compute_cov3D_python = True
     background = (
@@ -118,6 +134,8 @@ if __name__ == "__main__":
     init_screen_points = params["screen_points"]
     init_opacity = params["opacity"]
     init_shs = params["shs"]
+    init_temperature = gaussians.get_temperature
+    init_temperature_gradient = gaussians.get_temperature_gradient
 
     # throw away low opacity kernels
     mask = init_opacity[:, 0] > preprocessing_params["opacity_threshold"]
@@ -126,6 +144,9 @@ if __name__ == "__main__":
     init_opacity = init_opacity[mask, :]
     init_screen_points = init_screen_points[mask, :]
     init_shs = init_shs[mask, :]
+    gaussian_indices = gaussian_indices[mask]
+    init_temperature = init_temperature[mask]
+    init_temperature_gradient = init_temperature_gradient[mask]
 
     # rorate and translate object
     if args.debug:
@@ -140,6 +161,7 @@ if __name__ == "__main__":
         preprocessing_params["rotation_axis"],
     )
     rotated_pos = apply_rotations(init_pos, rotation_matrices)
+    init_temperature_gradient = apply_rotations(init_temperature_gradient, rotation_matrices)
 
     if args.debug:
         particle_position_tensor_to_ply(rotated_pos, "./log/rotated_particles.ply")
@@ -151,6 +173,7 @@ if __name__ == "__main__":
         None,
         None,
     )
+    unselected_temperature = None
     if preprocessing_params["sim_area"] is not None:
         boundary = preprocessing_params["sim_area"]
         assert len(boundary) == 6
@@ -163,14 +186,19 @@ if __name__ == "__main__":
         unselected_cov = init_cov[~mask, :]
         unselected_opacity = init_opacity[~mask, :]
         unselected_shs = init_shs[~mask, :]
+        unselected_temperature = init_temperature[~mask]
 
         rotated_pos = rotated_pos[mask, :]
         init_cov = init_cov[mask, :]
         init_opacity = init_opacity[mask, :]
         init_shs = init_shs[mask, :]
+        gaussian_indices = gaussian_indices[mask]
+        init_temperature = init_temperature[mask]
+        init_temperature_gradient = init_temperature_gradient[mask]
 
     transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, preprocessing_params["scale"])
     transformed_pos = shift2center111(transformed_pos)
+    init_temperature_gradient = init_temperature_gradient / scale_origin
 
     # modify covariance matrix accordingly
     init_cov = apply_cov_rotations(init_cov, rotation_matrices)
@@ -239,12 +267,19 @@ if __name__ == "__main__":
 
     # set up the mpm solver
     mpm_solver = MPM_Simulator_WARP(10)
+    mpm_init_temperature = torch.full((mpm_init_pos.shape[0],),
+                                     thermal_config.get("initial_temperature", 20.0), device=device)
+    mpm_init_temperature[:gaussian_indices.numel()] = init_temperature[:, 0]
+    mpm_init_temperature_gradient = torch.zeros_like(mpm_init_pos)
+    mpm_init_temperature_gradient[:gaussian_indices.numel()] = init_temperature_gradient
     mpm_solver.load_initial_data_from_torch(
         mpm_init_pos,
         mpm_init_vol,
         mpm_init_cov,
         n_grid=material_params["n_grid"],
         grid_lim=material_params["grid_lim"],
+        tensor_temperature=mpm_init_temperature,
+        tensor_temperature_gradient=mpm_init_temperature_gradient,
     )
     mpm_solver.set_parameters_dict(material_params)
 
@@ -252,6 +287,11 @@ if __name__ == "__main__":
     set_boundary_conditions(mpm_solver, bc_params, time_params)
 
     mpm_solver.finalize_mu_lam()
+    synchronize_gaussian_temperature(gaussians, mpm_solver, gaussian_indices,
+                                      rotation_matrices, scale_origin)
+    if args.output_temperature:
+        save_temperature_frame(os.path.join(args.output_path, "temperature"), 0,
+                               gaussians, mpm_solver, gaussian_indices)
 
     # camera setting
     mpm_space_viewpoint_center = (
@@ -318,6 +358,12 @@ if __name__ == "__main__":
         for step in range(step_per_frame):
             mpm_solver.p2g2p(frame, substep_dt, device=device)
 
+        synchronize_gaussian_temperature(gaussians, mpm_solver, gaussian_indices,
+                                          rotation_matrices, scale_origin)
+        if args.output_temperature:
+            save_temperature_frame(os.path.join(args.output_path, "temperature"), frame + 1,
+                                   gaussians, mpm_solver, gaussian_indices)
+
         if args.output_ply or args.output_h5:
             save_data_at_frame(
                 mpm_solver,
@@ -327,7 +373,7 @@ if __name__ == "__main__":
                 save_to_h5=args.output_h5,
             )
 
-        if args.render_img:
+        if args.render_img or args.render_temperature:
             pos = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
             cov3D = mpm_solver.export_particle_cov_to_torch()
             rot = mpm_solver.export_particle_R_to_torch()
@@ -350,27 +396,38 @@ if __name__ == "__main__":
                 opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
                 shs = torch.cat([shs_render, unselected_shs], dim=0)
 
-            colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
-            rendering, raddi = rasterize(
-                means3D=pos,
-                means2D=init_screen_points,
-                shs=None,
-                colors_precomp=colors_precomp,
-                opacities=opacity,
-                scales=None,
-                rotations=None,
-                cov3D_precomp=cov3D,
-            )
-            cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
-            cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-            if height is None or width is None:
-                height = cv2_img.shape[0] // 2 * 2
-                width = cv2_img.shape[1] // 2 * 2
-            assert args.output_path is not None
-            cv2.imwrite(
-                os.path.join(args.output_path, f"{frame}.png".rjust(8, "0")),
-                255 * cv2_img,
-            )
+            render_passes = []
+            if args.render_img:
+                render_passes.append((args.output_path,
+                                      convert_SH(shs, current_camera, gaussians, pos, rot), rasterize))
+            if args.render_temperature:
+                temperatures = mpm_solver.export_particle_temperature_to_torch()[:gs_num]
+                if unselected_temperature is not None:
+                    temperatures = torch.cat((temperatures, unselected_temperature[:, 0]))
+                thermal_directory = os.path.join(args.output_path, "thermal_images")
+                os.makedirs(thermal_directory, exist_ok=True)
+                thermal_rasterize = initialize_resterize(current_camera, gaussians, pipeline,
+                                                         torch.zeros_like(background))
+                render_passes.append((thermal_directory,
+                                      temperature_to_rgb(temperatures, *args.temperature_range), thermal_rasterize))
+            for directory, colors_precomp, render_pass in render_passes:
+                rendering, raddi = render_pass(
+                    means3D=pos,
+                    means2D=torch.zeros_like(pos),
+                    shs=None,
+                    colors_precomp=colors_precomp,
+                    opacities=opacity,
+                    scales=None,
+                    rotations=None,
+                    cov3D_precomp=cov3D,
+                )
+                cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
+                cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+                if height is None or width is None:
+                    height = cv2_img.shape[0] // 2 * 2
+                    width = cv2_img.shape[1] // 2 * 2
+                assert directory is not None
+                cv2.imwrite(os.path.join(directory, f"{frame:04d}.png"), 255 * cv2_img)
 
     if args.render_img and args.compile_video:
         fps = int(1.0 / time_params["frame_dt"])

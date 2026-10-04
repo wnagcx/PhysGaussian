@@ -36,6 +36,11 @@ pip install -e gaussian-splatting/submodules/diff-gaussian-rasterization/
 pip install -e gaussian-splatting/submodules/simple-knn/
 ```
 By default, We use pytorch=2.0.0+cu118.
+
+The CUDA Taichi memory reservation defaults to 2 GB so the simulator can share an
+8 GB GPU with PyTorch and Warp. Set `PHYS_GAUSSIAN_TAICHI_MEMORY_GB` before running
+`gs_simulation.py` if your scene needs a different reservation.
+
 ### Quick Start
 We provide several pretrained [Gaussian Splatting models](https://drive.google.com/drive/folders/1EMUOJbyJ2QdeUz8GpPrLEyN4LBvCO3Nx?usp=drive_link) and their corresponding `.json` config files in the `config` directory.
 
@@ -54,6 +59,15 @@ python gs_simulation.py --model_path ./model/ficus_whitebg-trained/ --output_pat
 Hopefully, you will see a video result like this:
 
 <img src="./demo/ficus.gif" width="300"/>
+
+## Temperature and Heat Conduction
+
+Gaussian kernels now carry temperature and temperature gradients. Add a `thermal`
+object to a scene config to enable affine thermal P2G, D3Q7 LBM diffusion and
+thermal G2P. Use `--render_temperature` for thermal images and
+`--output_temperature` for per-Gaussian snapshots. See [THERMAL.md](THERMAL.md)
+for configuration and numerical details. An example config is
+`config/ficus_thermal_config.json`.
 
 ## Custom Dynamics
 To generate custom dynamics, follow these guidelines:

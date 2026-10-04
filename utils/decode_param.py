@@ -8,6 +8,8 @@ def decode_param_json(json_file):
     f = open(json_file)
     sim_params = json.load(f)
     material_params = {}
+    if "thermal" in sim_params:
+        material_params["thermal"] = sim_params["thermal"]
     # material parameters
     if "material" in sim_params.keys():
         material_params["material"] = sim_params["material"]

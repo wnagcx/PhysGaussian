@@ -7,3 +7,6 @@ output
 *.jpg
 model
 log
+.thermal-test-deps/
+.thermal-cache/
+.thermal-test-output/

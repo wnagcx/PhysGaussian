@@ -58,6 +58,10 @@ class MPMStateStruct:
     particle_density: wp.array(dtype=float)  # density
     particle_Jp: wp.array(dtype=float)
 
+    # Passive thermal state, one value per Gaussian / MPM particle.
+    particle_temperature: wp.array(dtype=float)
+    particle_temperature_gradient: wp.array(dtype=wp.vec3)
+
     particle_selection: wp.array(
         dtype=int
     )  # only particle_selection[p] = 0 will be simulated

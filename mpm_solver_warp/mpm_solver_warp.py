@@ -5,6 +5,7 @@ sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from engine_utils import *
 from warp_utils import *
 from mpm_utils import *
+from thermal_utils import ThermalSolver, validate_thermal_config, set_particle_temperature_region
 
 
 class MPM_Simulator_WARP:
@@ -14,6 +15,8 @@ class MPM_Simulator_WARP:
 
     def initialize(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0"):
         self.n_particles = n_particles
+        self.device = device
+        self.thermal_solver = None
 
         self.mpm_model = MPMModelStruct()
         # domain will be [0,grid_lim]*[0,grid_lim]*[0,grid_lim] !!!
@@ -109,6 +112,13 @@ class MPM_Simulator_WARP:
         self.mpm_state.particle_selection = wp.zeros(
             shape=n_particles, dtype=int, device=device
         )
+        self.mpm_state.particle_temperature = wp.zeros(
+            shape=n_particles, dtype=float, device=device
+        )
+        self.mpm_state.particle_temperature.fill_(20.0)
+        self.mpm_state.particle_temperature_gradient = wp.zeros(
+            shape=n_particles, dtype=wp.vec3, device=device
+        )
 
         self.mpm_state.grid_m = wp.zeros(
             shape=(self.mpm_model.n_grid, self.mpm_model.n_grid, self.mpm_model.n_grid),
@@ -199,13 +209,20 @@ class MPM_Simulator_WARP:
         n_grid=100,
         grid_lim=1.0,
         device="cuda:0",
+        tensor_temperature=None,
+        tensor_temperature_gradient=None,
     ):
         self.dim, self.n_particles = tensor_x.shape[1], tensor_x.shape[0]
         assert tensor_x.shape[0] == tensor_volume.shape[0]
         # assert tensor_x.shape[0] == tensor_cov.reshape(-1, 6).shape[0]
         self.initialize(self.n_particles, n_grid, grid_lim, device=device)
 
-        self.import_particle_x_from_torch(tensor_x, device)
+        self.import_particle_x_from_torch(tensor_x, device=device)
+        if tensor_temperature is not None:
+            self.import_particle_temperature_from_torch(tensor_temperature, device=device)
+        if tensor_temperature_gradient is not None:
+            self.import_particle_temperature_gradient_from_torch(
+                tensor_temperature_gradient, device=device)
         self.mpm_state.particle_vol = wp.from_numpy(
             tensor_volume.detach().clone().cpu().numpy(), dtype=float, device=device
         )
@@ -242,9 +259,12 @@ class MPM_Simulator_WARP:
 
     # must give density. mass will be updated as density * volume
     def set_parameters(self, device="cuda:0", **kwargs):
-        self.set_parameters_dict(device, kwargs)
+        self.set_parameters_dict(kwargs, device=device)
 
     def set_parameters_dict(self, kwargs={}, device="cuda:0"):
+        thermal_config = None
+        if "thermal" in kwargs:
+            thermal_config = validate_thermal_config(kwargs["thermal"])
         if "material" in kwargs:
             if kwargs["material"] == "jelly":
                 self.mpm_model.material = 0
@@ -379,6 +399,47 @@ class MPM_Simulator_WARP:
                 device=device,
             )
 
+        # Recreate thermal grids when mechanical grid dimensions change.
+        if thermal_config is not None:
+            self.configure_thermal(thermal_config, device=device)
+        elif self.thermal_solver is not None:
+            self.thermal_solver = ThermalSolver(self.mpm_model.n_grid, device,
+                                                self.thermal_solver.config)
+
+    def configure_thermal(self, config, device=None):
+        device = self.device if device is None else device
+        config = validate_thermal_config(config)
+        self.thermal_solver = None
+        if "initial_temperature" in config:
+            self.mpm_state.particle_temperature.fill_(config["initial_temperature"])
+            self.mpm_state.particle_temperature_gradient.zero_()
+        for region in config["initial_regions"]:
+            wp.launch(set_particle_temperature_region, dim=self.n_particles,
+                      inputs=[self.mpm_state, wp.vec3(region["point"]),
+                              wp.vec3(region["size"]), region["temperature"]], device=device)
+        if config["enabled"]:
+            self.thermal_solver = ThermalSolver(self.mpm_model.n_grid, device, config)
+
+    def import_particle_temperature_from_torch(self, temperature, device=None):
+        device = self.device if device is None else device
+        values = temperature.detach().reshape(-1).to(dtype=torch.float32).cpu().numpy()
+        if values.shape != (self.n_particles,) or not np.isfinite(values).all():
+            raise ValueError("temperature must contain one finite value per particle")
+        self.mpm_state.particle_temperature = wp.from_numpy(values.copy(), dtype=float, device=device)
+
+    def import_particle_temperature_gradient_from_torch(self, gradient, device=None):
+        device = self.device if device is None else device
+        values = gradient.detach().to(dtype=torch.float32).cpu().numpy()
+        if values.shape != (self.n_particles, 3) or not np.isfinite(values).all():
+            raise ValueError("temperature gradient must have shape (n_particles, 3)")
+        self.mpm_state.particle_temperature_gradient = wp.from_numpy(values.copy(), dtype=wp.vec3, device=device)
+
+    def export_particle_temperature_to_torch(self):
+        return wp.to_torch(self.mpm_state.particle_temperature)
+
+    def export_particle_temperature_gradient_to_torch(self):
+        return wp.to_torch(self.mpm_state.particle_temperature_gradient)
+
     def finalize_mu_lam(self, device="cuda:0"):
         wp.launch(
             kernel=compute_mu_lam_from_E_nu,
@@ -450,6 +511,9 @@ class MPM_Simulator_WARP:
             )  # apply p2g'
 
         # grid update
+        if self.thermal_solver is not None:
+            self.thermal_solver.p2g(self.mpm_state, self.mpm_model, self.n_particles)
+
         with wp.ScopedTimer(
             "grid_update", synchronize=True, print=False, dict=self.time_profile
         ):
@@ -487,6 +551,12 @@ class MPM_Simulator_WARP:
                 )
                 if self.modify_bc[k] is not None:
                     self.modify_bc[k](self.time, dt, self.collider_params[k])
+
+        if self.thermal_solver is not None:
+            self.thermal_solver.advance(self.mpm_model, self.time, dt)
+            # Both transfers must use the same particle positions. Mechanical
+            # G2P advances x, so thermal G2P is evaluated just before it.
+            self.thermal_solver.g2p(self.mpm_state, self.mpm_model, self.n_particles)
 
         # g2p
         with wp.ScopedTimer(

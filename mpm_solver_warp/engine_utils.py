@@ -43,6 +43,9 @@ def save_data_at_frame(mpm_solver, dir_name, frame, save_to_ply=True, save_to_h5
             mpm_solver.mpm_state.particle_C.numpy().reshape(-1, 9).transpose()
         )  # shape = (9, n_particles)
         newFile.create_dataset("C", data=C_np)  # particle C
+        newFile.create_dataset("temperature", data=mpm_solver.mpm_state.particle_temperature.numpy())
+        newFile.create_dataset("temperature_gradient", data=mpm_solver.mpm_state.particle_temperature_gradient.numpy().transpose())
+        newFile.close()
         print("save siumlation data at frame ", frame, " to ", fullfilename)
 
 
@@ -53,6 +56,9 @@ def particle_position_to_ply(mpm_solver, filename):
     position = mpm_solver.mpm_state.particle_x.numpy()
     num_particles = (position).shape[0]
     position = position.astype(np.float32)
+    temperature = mpm_solver.mpm_state.particle_temperature.numpy().reshape(-1, 1)
+    gradient = mpm_solver.mpm_state.particle_temperature_gradient.numpy()
+    attributes = np.concatenate((position, temperature, gradient), axis=1).astype('<f4')
     with open(filename, "wb") as f:  # write binary
         header = f"""ply
 format binary_little_endian 1.0
@@ -60,10 +66,14 @@ element vertex {num_particles}
 property float x
 property float y
 property float z
+property float temperature
+property float temperature_gradient_x
+property float temperature_gradient_y
+property float temperature_gradient_z
 end_header
 """
         f.write(str.encode(header))
-        f.write(position.tobytes())
+        f.write(attributes.tobytes())
         print("write", filename)
 
 
